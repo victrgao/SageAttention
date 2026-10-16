@@ -5,3 +5,5 @@ from .core import sageattn_qk_int8_pv_fp8_cuda
 from .core import sageattn_qk_int8_pv_fp8_cuda_sm90
 from .core import sageattn_qk_int8_pv_gfx12_native
 from .gfx12_exact import sageattn_qk_int8_pv_fp8_gfx1201_exact
+from .gfx12_exact import sageattn_qk_int8_pv_fp8_gfx1201_exact_prepacked
+from .gfx12_int4 import sageattn_qk_int4_pv_fp8_gfx12, sageattn_qk_int4_pv_fp8_gfx12_norm_rope

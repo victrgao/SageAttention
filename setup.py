@@ -184,6 +184,22 @@ if not SKIP_CUDA_BUILD:
                         extra_compile_args={"cxx": CXX_FLAGS, "nvcc": exact_flags},
                     )
                 )
+            int4_arches = [arch for arch in amd_arches if arch in ("gfx1200", "gfx1201")]
+            if int4_arches:
+                # sage_int4 0.1.4 flags; true16 stays off because the inline fp8 pack writes full dwords.
+                int4_flags = [
+                    "-O3", *clang_std, *[f"--offload-arch={arch}" for arch in int4_arches],
+                    f"--rocm-path={rocm_home}", "-Xclang", "-target-feature", "-Xclang", "-real-true16",
+                    "-DSAGE_BLOCK_M=384", "-DSAGE_WAVES_PER_EU=6", "-mllvm", "-amdgpu-sched-strategy=max-ilp",
+                ]
+                ext_modules.append(
+                    CUDAExtension(
+                        name="sageattention._qattn_gfx12_int4",
+                        sources=["csrc/qattn/gfx12_int4/attention.cu"],
+                        include_dirs=include_dirs,
+                        extra_compile_args={"cxx": CXX_FLAGS, "nvcc": int4_flags},
+                    )
+                )
         else:
             warnings.warn(
                 "ROCm build detected, but no gfx12 architecture was selected; "
