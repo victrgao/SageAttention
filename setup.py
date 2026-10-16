@@ -170,6 +170,20 @@ if not SKIP_CUDA_BUILD:
                     extra_compile_args={"cxx": CXX_FLAGS, "nvcc": HIP_FLAGS},
                 )
             )
+            if "gfx1201" in amd_arches:
+                compact_flags = [
+                    "-O3", *clang_std, "-fgpu-flush-denormals-to-zero",
+                    "--offload-arch=gfx1201", f"--rocm-path={rocm_home}",
+                    "-mllvm", "-amdgpu-sched-strategy=max-ilp",
+                ]
+                ext_modules.append(
+                    CUDAExtension(
+                        name="sageattention._qattn_gfx12_compact",
+                        sources=["csrc/qattn/gfx12_compact/attention.cu"],
+                        include_dirs=include_dirs,
+                        extra_compile_args={"cxx": CXX_FLAGS, "nvcc": compact_flags},
+                    )
+                )
         else:
             warnings.warn(
                 "ROCm build detected, but no gfx12 architecture was selected; "
