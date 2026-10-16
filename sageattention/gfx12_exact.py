@@ -46,3 +46,27 @@ def sageattn_qk_int8_pv_fp8_gfx1201_exact(
             query_int8, key_int8, value_fp8, output, query_scale, key_scale, value_scale, scale, length,
         )[:, :length].contiguous()
         return output if tensor_layout == "NHD" else output.transpose(1, 2).contiguous()
+
+
+@torch.no_grad()
+def sageattn_qk_int8_pv_fp8_gfx1201_exact_prepacked(
+    q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, seq_len, sm_scale=None,
+):
+    """The exact-exp2 core on inputs already quantized in its layout, e.g. by the LightX2V MiniMax-H3 fused
+    QK-norm/RoPE/int8 prepare with lane-major K/V.
+
+    q_int8 int8 [B, S, H, 128], q_scale fp32 [B, H, ceil(S/32)] (log2(e) folded in, sm_scale applied by the kernel);
+    k_int8 int8 [B, H, S_pad, 128] lane-major, k_scale fp32 [B, H, S_pad/64];
+    v_fp8 fp8 e4m3 bits [B, H, 128, S_pad] lane-major, v_scale fp32 [B, H, 128]; seq_len = valid K/V length.
+    Returns bf16 [B, S, H, 128] (a view of a padded buffer).
+    """
+    attention = importlib.import_module("sageattention._qattn_gfx12_exact")
+    if v_fp8.dtype == torch.float8_e4m3fn:
+        v_fp8 = v_fp8.view(torch.uint8)
+    batch, length, heads, _ = q_int8.shape
+    scale = 128 ** -0.5 if sm_scale is None else float(sm_scale)
+    output = torch.empty((batch, ((length + 511) // 512) * 512, heads, 128), device=q_int8.device,
+                         dtype=torch.bfloat16)
+    return attention.attention(
+        q_int8, k_int8, v_fp8, output, q_scale, k_scale, v_scale, scale, seq_len,
+    )[:, :length]
