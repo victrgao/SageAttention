@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SageAttention core for gfx12 (RDNA4): INT8 QK^T (V_WMMA_I32_16X16X16_IU8) + FP8 PV, D128, non-causal,
-// exact exp2 probabilities.
-// Data layout and arithmetic = the approx_lsum_latescale snapshot kernel built with APPROX_FP8_P=0 (bitwise target):
+// Approximate FP8 probabilities with a dot4 denominator.
+// Lane-major INT8 QK / FP8 PV layout:
 //   Q   int8 [B, S, H, 128], QScale [B, H, ceil(S/32)]   (sm_scale * log2(e) applied here)
 //   K   int8 [B, H, S_pad64, 128], lane-major 32-key tiles, KScale [B, H, S_pad64/64]
 //   V   fp8 e4m3 [B, H, 128, >= S_pad64], lane-major 32-key tiles, VScale [B, H, 128]
@@ -34,7 +34,7 @@
 #define SAGE_ASM_SOFTMAX 1
 #endif
 #ifndef SAGE_APPROX_FP8_P
-#define SAGE_APPROX_FP8_P 0
+#define SAGE_APPROX_FP8_P 1
 #endif
 #ifndef SAGE_V_PRELOAD_ALL
 #define SAGE_V_PRELOAD_ALL 1
@@ -53,7 +53,7 @@
 #endif
 // Row max as hand-scheduled asm: four interleaved max3 chains instead of one serial chain per row group.
 #ifndef SAGE_ASM_ROWMAX
-#define SAGE_ASM_ROWMAX 0
+#define SAGE_ASM_ROWMAX 1
 #endif
 // Timing ablation only (wrong results): skip the row max and rescale after the first tile.
 #ifndef SAGE_ABL_FROZEN_M
