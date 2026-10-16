@@ -28,7 +28,7 @@
 #endif
 // K-steps whose K fragments are read before the first QK WMMA; deeper preloads spill at 6 waves/SIMD.
 #ifndef SAGE_K_PRELOAD
-#define SAGE_K_PRELOAD 2
+#define SAGE_K_PRELOAD 4
 #endif
 #ifndef SAGE_ASM_SOFTMAX
 #define SAGE_ASM_SOFTMAX 1
@@ -79,6 +79,7 @@ constexpr int WARP = 32;
 constexpr int BLOCK_M = SAGE_BLOCK_M;
 constexpr int BLOCK_N = 32;
 constexpr int HEAD_DIM = 128;
+constexpr int QUERY_GRID_GROUP = 64;
 constexpr int ROWS_PER_WAVE = 32;
 constexpr int ROW_GROUPS = 2;
 constexpr int NUM_WAVES = BLOCK_M / ROWS_PER_WAVE;
@@ -148,7 +149,7 @@ __device__ __forceinline__ float max_num(float a, float b) {
   return r;
 }
 
-#include "softmax_asm.cuh"
+#include "softmax_scalar_scale.cuh"
 #include "rowmax_asm.cuh"
 
 __device__ __forceinline__ void lds_release() { __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local"); }
@@ -173,9 +174,11 @@ void attn_int8_port_kernel(
   const int lane = tid % WARP;
   const int lane16 = lane % 16;
   const int klane = lane / 16;
-  const int head = (int)blockIdx.y;
+  const int head = (int)blockIdx.x / QUERY_GRID_GROUP;
   const int64_t batch = blockIdx.z;
-  const int wave_q = (int)blockIdx.x * BLOCK_M + wave * ROWS_PER_WAVE;
+  const int query_block = (int)blockIdx.y * QUERY_GRID_GROUP + (int)blockIdx.x % QUERY_GRID_GROUP;
+  if (query_block * BLOCK_M >= qo_len) return;
+  const int wave_q = query_block * BLOCK_M + wave * ROWS_PER_WAVE;
   auto uni = [](int x) -> int { return __builtin_amdgcn_readfirstlane(x); };
 
   // B operand of QK: lane holds query lane16, dims ks*16 + klane*8 + [0, 8).
@@ -264,6 +267,7 @@ void attn_int8_port_kernel(
     const int cur = (kv_start / BLOCK_N) & 1;
     // The tail's wait is issued after the loop so every signal is paired.
     if constexpr (!MASK_TAIL) barrier_wait();
+    asm volatile("s_setprio 2");
 
     float k_scale;
     if constexpr (SAGE_KSCALE_AHEAD) {
@@ -297,8 +301,10 @@ void attn_int8_port_kernel(
       }
     }
     // The idle buffer has been free since the barrier; publishing after QK keeps the stores behind the K reads.
+    asm volatile("s_setprio 1");
     commit(cur ^ 1);
     prefetch(safe_tile(kv_start + 2 * BLOCK_N));
+    asm volatile("s_setprio 0");
 
     if constexpr (!SAGE_KSCALE_AHEAD) k_scale = ks_head[kv_start / K_SCALE_GROUP];
     float sc[ROW_GROUPS];
@@ -398,7 +404,7 @@ void attn_int8_port_kernel(
     if constexpr (!MASK_TAIL && SAGE_ASM_SOFTMAX) {
       // The asm computes fma(x, sc, -m_off); -(m - 8.807) rounds exactly like the baseline's 8.807 - m.
       const float m_off[ROW_GROUPS] = {m_run[0] - FP8_P_OFFSET, m_run[1] - FP8_P_OFFSET};
-      softmax_asm(s_acc, sc, m_off, p_frags, local_sum);
+      softmax_scalar_scale(s_acc, sc, m_off, p_frags, local_sum);
     } else {
       #pragma unroll
       for (int rg = 0; rg < ROW_GROUPS; ++rg) {
@@ -431,6 +437,7 @@ void attn_int8_port_kernel(
       for (int dc = 0; dc < D_CHUNKS; ++dc)
         pv_last[dc] = load8(lds + rd + TILE_BYTES + (D_CHUNKS + dc) * FRAG_BYTES);
     }
+    asm volatile("s_setprio 3");
     #pragma unroll
     for (int dc = 0; dc < D_CHUNKS; ++dc)
       #pragma unroll
@@ -458,6 +465,7 @@ void attn_int8_port_kernel(
     process_tile(tile_start, std::false_type{});
   barrier_wait();
   if (full_end < kv_len) process_tile(full_end, std::true_type{});
+  asm volatile("s_setprio 0");
 
   const float* vs_head = VScale + ((int64_t)batch * num_heads + head) * HEAD_DIM;
   #pragma unroll
@@ -516,7 +524,10 @@ torch::Tensor attention(torch::Tensor query, torch::Tensor key, torch::Tensor va
               "Invalid key scale");
   TORCH_CHECK(value_scale.scalar_type() == torch::kFloat32 && value_scale.is_contiguous() &&
               value_scale.numel() == batch * heads * HEAD_DIM, "Invalid value scale");
-  const dim3 grid((unsigned)((qo_len + BLOCK_M - 1) / BLOCK_M), (unsigned)heads, (unsigned)batch);
+  const unsigned query_blocks = (qo_len + BLOCK_M - 1) / BLOCK_M;
+  const dim3 grid(static_cast<unsigned>(heads * QUERY_GRID_GROUP),
+                  (query_blocks + QUERY_GRID_GROUP - 1) / QUERY_GRID_GROUP,
+                  static_cast<unsigned>(batch));
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   attn_int8_port_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), reinterpret_cast<const int8_t*>(value.data_ptr<uint8_t>()),
