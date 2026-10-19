@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // INT4 QK^T + FP8 PV attention for gfx12 (gfx1200 / gfx1201), D128, non-causal: torch binding.
-// The kernel (attn_int4_qk_opt.cuh) is sage_int4 0.1.4's csrc/attn_int4_gfx12.cu, unmodified; inputs come from
+// The kernel is based on sage_int4 0.1.4, with optional lossy FP8 probabilities; inputs come from
 // sageattention/triton/quant_gfx12_int4.py (prepare_int4 / prepare_int4_norm_rope).
 #include <torch/extension.h>
 #include <ATen/hip/HIPContext.h>
@@ -11,7 +11,8 @@
 #include "attn_int4_qk_opt.cuh"
 
 torch::Tensor attention(torch::Tensor q, torch::Tensor q_scale, torch::Tensor k, torch::Tensor k_scale,
-                        torch::Tensor v, torch::Tensor v_scale, torch::Tensor out, int64_t valid_seq_len) {
+                        torch::Tensor v, torch::Tensor v_scale, torch::Tensor out, int64_t valid_seq_len,
+                        bool approximate) {
   TORCH_CHECK(q.is_cuda(), "Expected query on a ROCm GPU");
   const c10::DeviceGuard device_guard(q.device());
   const std::string arch = at::cuda::getCurrentDeviceProperties()->gcnArchName;
@@ -40,15 +41,21 @@ torch::Tensor attention(torch::Tensor q, torch::Tensor q_scale, torch::Tensor k,
               "Expected contiguous bf16 [B, S_pad, H, 128] output");
   const unsigned grid = static_cast<unsigned>(batch * ((valid_seq_len + BLOCK_M - 1) / BLOCK_M) * heads);
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
-  sage_hip_attn_i4_bn32<<<grid, BLOCK_SIZE, 0, stream>>>(
-      q.data_ptr<int8_t>(), k.data_ptr<int8_t>(), reinterpret_cast<const int8_t*>(v.data_ptr()),
-      q_scale.data_ptr<float>(), k_scale.data_ptr<float>(), v_scale.data_ptr<float>(),
-      reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
-      static_cast<int>(batch), static_cast<int>(s_pad), static_cast<int>(valid_seq_len), static_cast<int>(heads));
+  auto launch = [&](auto mode) {
+    sage_hip_attn_i4_bn32<decltype(mode)::value><<<grid, BLOCK_SIZE, 0, stream>>>(
+        q.data_ptr<int8_t>(), k.data_ptr<int8_t>(), reinterpret_cast<const int8_t*>(v.data_ptr()),
+        q_scale.data_ptr<float>(), k_scale.data_ptr<float>(), v_scale.data_ptr<float>(),
+        reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
+        static_cast<int>(batch), static_cast<int>(s_pad), static_cast<int>(valid_seq_len), static_cast<int>(heads));
+  };
+  if (approximate) launch(std::true_type{});
+  else launch(std::false_type{});
   TORCH_CHECK(hipGetLastError() == hipSuccess, "sage_hip_attn_i4_bn32 launch failed");
   return out;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
-  module.def("attention", &attention);
+  module.def("attention", &attention, pybind11::arg("q"), pybind11::arg("q_scale"),
+             pybind11::arg("k"), pybind11::arg("k_scale"), pybind11::arg("v"), pybind11::arg("v_scale"),
+             pybind11::arg("out"), pybind11::arg("valid_seq_len"), pybind11::arg("approximate") = false);
 }
